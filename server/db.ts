@@ -7,7 +7,15 @@ import { SCHEMA } from './schema.js';
 // Erro de configuração (variável de ambiente faltando). A API responde 503 com uma mensagem clara.
 export class ConfigError extends Error {}
 
-const dbUrl = () => process.env.DATABASE_URL || process.env.POSTGRES_URL || '';
+// Aceita DATABASE_URL, POSTGRES_URL e também o nome que a integração Vercel+Supabase cria com prefixo (ex.: DATABASE_POSTGRES_URL).
+// Nunca usa as variáveis *_NON_POOLING nem *_PRISMA_URL: a conexão certa para serverless é a "pooled".
+const dbUrl = () => {
+  const e = process.env;
+  if (e.DATABASE_URL) return e.DATABASE_URL;
+  if (e.POSTGRES_URL) return e.POSTGRES_URL;
+  const k = Object.keys(e).find((n) => /POSTGRES_URL$/.test(n) && !/NON_POOLING|PRISMA/.test(n) && e[n]);
+  return k ? e[k]! : '';
+};
 export const hasDbUrl = () => !!dbUrl();
 
 let client: any = null;
