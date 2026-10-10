@@ -1,31 +1,29 @@
 # Atha — rotina, hábitos, tarefas e treinos
 
-Uma pasta só: Angular + TailwindCSS (`src/`) e Node + Express + SQLite (`server/`, banco no arquivo `atha.db`).
+Angular + TailwindCSS (`src/`) e API Node/Express (`server/`) com banco PostgreSQL.
+No Vercel, o front é servido como site estático e a API roda como Vercel Function (`api/index.ts`). O banco é externo (Supabase, Neon...), e as tabelas são criadas automaticamente no primeiro acesso.
 
-## Rodar localmente (um comando)
+## Subir no Vercel (resumo)
+1. **Banco:** crie um projeto no Supabase (ou um Postgres pelo Vercel Storage/Neon) e copie a string de conexão do **pooler** (Supabase: *Connect > Transaction pooler*, porta 6543).
+2. **Vercel > Settings > Environment Variables** (marque Production, Preview e Development):
+   - `DATABASE_URL` = a string de conexão (se a senha tiver `@`, `#` etc., codifique: `@` vira `%40`)
+   - `JWT_SECRET` = texto longo e aleatório: `node -e "console.log(require('crypto').randomBytes(48).toString('hex'))"`
+3. Faça o deploy (ou *Redeploy*). O `vercel.json` já define build, pasta de saída e o roteamento de `/api`.
+4. Abra `https://SEU-APP.vercel.app/api/health`: deve responder `{"ok":true}`. Se não, a resposta diz o que falta.
+
+## Rodar localmente
 ```bash
+cp .env.example .env     # preencha DATABASE_URL e JWT_SECRET (pode ser o mesmo banco do Supabase ou outro, só para testes)
 npm install
 npm run dev
 ```
-- App: http://localhost:4200 (o `ng serve` do Angular 20 já roda sobre o Vite) · API: http://localhost:3000
-- No celular (mesmo Wi-Fi): abra `http://IP-DO-SEU-PC:4200`.
-- Crie sua conta na primeira tela. Seus dados ficam em `atha.db` (faça backup desse arquivo).
-
-## Produção (app + API + banco em um só serviço)
-```bash
-npm run build && JWT_SECRET=um-segredo-longo npm start     # tudo em http://localhost:3000
-# ou
-docker build -t atha . && docker run -p 3000:3000 -v atha-data:/data -e JWT_SECRET=um-segredo-longo atha
-```
-Em Render, Railway ou Fly.io: use o Dockerfile, monte um volume em `/data` e defina `JWT_SECRET`.
-
-## Variáveis de ambiente (produção)
-- `JWT_SECRET` — obrigatória quando `NODE_ENV=production` (use um valor longo e aleatório)
-- `TRUST_PROXY=1` — se estiver atrás de proxy/PaaS (Render, Railway, Fly...), para o limite de tentativas de login usar o IP real
-- `DB_FILE`, `PORT`
-
-Planejamento de login, ativação por e-mail, Google, termos e área de admin: `docs/PRODUTO-AUTH.md`.
+- App: http://localhost:4200 · API: http://localhost:3000 (o `ng serve` já repassa `/api` para a API)
+- No celular (mesmo Wi-Fi): `http://IP-DO-SEU-PC:4200`
 
 ## Estrutura
-- `server/index.ts` — rotas, JWT e SQLite (usuários, hábitos com dias da semana, tarefas, check-ins, treinos, sessões/séries, atividade/streak)
+- `api/index.ts` — entrada da Function no Vercel (exporta o app Express)
+- `server/app.ts` — rotas, JWT, regras de senha, limite de tentativas (no banco)
+- `server/db.ts` e `server/schema.ts` — conexão Postgres e tabelas (criadas automaticamente)
+- `server/index.ts` — servidor local (dev)
 - `src/app` — `core.ts` (API, auth), `shell.ts` (barra inferior), `pages/*`
+- `docs/PRODUTO-AUTH.md` — plano de ativação por e-mail, login com Google, termos e área de admin

@@ -1,5 +1,9 @@
 node_modules
 dist
 .angular
-*.db
-*.db-*
+.vercel
+
+# segredos: nunca vão para o GitHub (use .env.example como modelo)
+.env
+.env.*
+!.env.example

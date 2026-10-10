@@ -6,7 +6,7 @@ Status: **[feito]** já está no código · **[plano]** só desenhado, ainda nã
 - Mínimo de 10 caracteres, com minúscula, maiúscula, número e símbolo; sem nome/e-mail dentro da senha; sem senhas comuns. Máximo de 128.
 - A mesma regra roda no front (checklist ao vivo em `src/app/core.ts`) e no servidor (`server/index.ts`), que é quem vale.
 - Vale para novos cadastros. Quem já tem conta mantém a senha atual.
-- Login: 5 erros por IP + e-mail bloqueiam por 15 min (em memória; com mais de uma instância, trocar por Redis). Mesma mensagem e mesmo custo de tempo para e-mail inexistente ou senha errada.
+- Login: 5 erros por IP + e-mail bloqueiam por 15 min (guardado na tabela `rate_limits` do banco, porque no Vercel cada requisição pode cair em uma instância diferente). Mesma mensagem e mesmo custo de tempo para e-mail inexistente ou senha errada.
 - Próximos passos: checar a senha contra vazamentos (API Pwned Passwords, k-anonymity) e migrar o hash de scrypt para argon2id.
 
 ## 2. Ativação de conta por e-mail [plano]
@@ -33,7 +33,7 @@ Status: **[feito]** já está no código · **[plano]** só desenhado, ainda nã
 3. Se já existe `identities(provider='google', provider_user_id=sub)`, faz login. Se não, procura o usuário pelo e-mail: **se já tem conta com senha, pede o login normal antes de vincular** (evita sequestro de conta); se não existe, cria o usuário. A conta do Google já vale como e-mail verificado.
 4. O servidor devolve o mesmo JWT de hoje; o resto do app não muda.
 
-**Banco**: `identities(id, user_id, provider, provider_user_id, email, created_at, UNIQUE(provider, provider_user_id))` e `users.hash` passa a aceitar NULL (usuário só com Google; exige recriar a tabela no SQLite).
+**Banco**: `identities(id, user_id, provider, provider_user_id, email, created_at, UNIQUE(provider, provider_user_id))` e `users.hash` passa a aceitar NULL (usuário só com Google; em Postgres basta `ALTER COLUMN hash DROP NOT NULL`).
 **Configuração**: projeto no Google Cloud, tela de consentimento, Client ID Web, origens autorizadas (localhost:4200 e o domínio final), variável `GOOGLE_CLIENT_ID`. O aceite dos termos continua obrigatório no primeiro acesso.
 
 ## 4. Termos e privacidade [feito, texto é rascunho]
@@ -49,7 +49,7 @@ Status: **[feito]** já está no código · **[plano]** só desenhado, ainda nã
 - Log de auditoria de tudo o que o admin consulta; a ação precisa constar nos termos.
 
 ## 6. Antes de abrir ao público
-HTTPS obrigatório · `JWT_SECRET` forte (o servidor já recusa subir em produção sem ele) · `TRUST_PROXY=1` atrás de proxy · backup diário do banco (`atha.db` ou volume) · avaliar PostgreSQL se houver várias instâncias · cabeçalhos de segurança (helmet + CSP) · logs e monitoramento · página de contato/suporte.
+HTTPS obrigatório · `JWT_SECRET` forte (o servidor já recusa subir em produção sem ele) · backup do banco (Supabase/Neon fazem backups automáticos em planos pagos; confira o seu plano) · cabeçalhos de segurança (helmet + CSP) · logs e monitoramento · página de contato/suporte.
 
 ## 7. Configurações da conta [feito]
 - Menu ☰ → **Configurações**: alterar nome, e-mail e senha, e excluir a conta. **Ajuda** traz um FAQ.
