@@ -1,6 +1,7 @@
 {
   "name": "atha",
   "private": true,
+  "type": "module",
   "engines": { "node": "22.x" },
   "scripts": {
     "dev": "concurrently -k -n api,web -c yellow,cyan \"npm:dev:api\" \"npm:dev:web\"",

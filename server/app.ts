@@ -5,7 +5,7 @@
 import express from 'express';
 import jwt from 'jsonwebtoken';
 import { randomBytes, scryptSync, timingSafeEqual } from 'node:crypto';
-import { ConfigError, ensureSchema, getSql, hasDbUrl } from './db';
+import { ConfigError, ensureSchema, getSql, hasDbUrl } from './db.js';
 
 declare global { namespace Express { interface Request { uid: number } } }
 

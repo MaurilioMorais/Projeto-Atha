@@ -2,7 +2,7 @@
 // Conexão com o PostgreSQL (Supabase, Neon ou qualquer outro) usando o pacote `postgres`.
 // A conexão é criada só no primeiro uso (lazy) e fica guardada enquanto a instância da função estiver viva.
 import postgres from 'postgres';
-import { SCHEMA } from './schema';
+import { SCHEMA } from './schema.js';
 
 // Erro de configuração (variável de ambiente faltando). A API responde 503 com uma mensagem clara.
 export class ConfigError extends Error {}
