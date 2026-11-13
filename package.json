@@ -9,7 +9,8 @@
     "dev:web": "ng serve --host 0.0.0.0",
     "build": "ng build",
     "start": "tsx server/index.ts",
-    "typecheck": "tsc -p tsconfig.server.json"
+    "typecheck": "tsc -p tsconfig.server.json",
+    "test:integrations": "tsx scripts/integrations-smoke.ts"
   },
   "dependencies": {
     "@angular/common": "^20.0.0", "@angular/compiler": "^20.0.0", "@angular/core": "^20.0.0", "@angular/forms": "^20.0.0",
