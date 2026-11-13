@@ -4,10 +4,10 @@
 //  - localmente, com `npm run dev` (server/index.ts faz o listen).
 import express from 'express';
 import jwt from 'jsonwebtoken';
-import { randomBytes, scryptSync, timingSafeEqual } from 'node:crypto';
+import { createHash, randomBytes, scryptSync, timingSafeEqual } from 'node:crypto';
 import { ConfigError, ensureSchema, getSql, hasDbUrl } from './db.js';
 
-declare global { namespace Express { interface Request { uid: number } } }
+declare global { namespace Express { interface Request { uid: number; scopes: string[]; agent: boolean } } }
 
 // `sql` é só um atalho: abre a conexão no primeiro uso. Use como tagged template: sql`select ... ${valor}`
 const sql: any = Object.assign((...a: any[]) => getSql()(...a), { begin: (fn: any) => getSql().begin(fn) });
@@ -16,6 +16,8 @@ const DAYS = ['Domingo', 'Segunda', 'Terça', 'Quarta', 'Quinta', 'Sexta', 'Sáb
 const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/;
 const STATUSES = ['SEM_PLANEJAMENTO', 'NAO_INICIADA', 'INICIADA', 'FINALIZADA'];
+const ALL_SCOPES = ['habits:read', 'habits:write', 'tasks:read', 'tasks:write', 'dashboard:read', 'checkins:read', 'checkins:write', 'workouts:read', 'workouts:write'];
+const DEFAULT_SCOPES = 'habits:read,habits:write,tasks:read,tasks:write,dashboard:read';
 
 // ---------- configuração ----------
 const isProd = () => process.env.NODE_ENV === 'production' || !!process.env.VERCEL;
@@ -30,6 +32,14 @@ const secret = () => {
 const iso = (d = new Date()) => `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
 const addDays = (s: string, n: number) => { const d = new Date(s + 'T12:00'); d.setDate(d.getDate() + n); return iso(d); };
 const dateOr = (v: unknown, fallback: string) => (DATE_RE.test(String(v ?? '')) ? String(v) : fallback);
+// mesmo formato do nowL do front (YYYY-MM-DDTHH:MM). `day` (YYYY-MM-DD) troca só a data, para a integração marcar o dia certo.
+const nowL = (day?: unknown) => {
+  const d = new Date();
+  const date = DATE_RE.test(String(day ?? '')) ? String(day) : iso(d);
+  return `${date}T${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`;
+};
+const sha256 = (s: string) => createHash('sha256').update(s).digest('hex');
+const touch = () => new Date().toISOString();
 
 // dias da semana do hábito: '' = todos os dias, senão "1,3,5" (0 = domingo)
 const wkStr = (a: unknown) => { const u = [...new Set((Array.isArray(a) ? a : []).map(Number).filter(n => Number.isInteger(n) && n >= 0 && n <= 6))].sort(); return u.length === 7 ? '' : u.join(','); };
@@ -144,12 +154,27 @@ app.post('/api/auth/login', A(async (req: any, res: any) => {
 // ---------- rotas autenticadas ----------
 const r = express.Router();
 r.use(A(async (req: any, res: any, next: any) => {
+  const raw = (req.headers.authorization || '').slice(7);
   try {
-    const tk: any = jwt.verify((req.headers.authorization || '').slice(7), secret());
-    const [u] = await sql`select token_valid_after::float8 as tva from users where id = ${Number(tk.id)}`;
-    // sem usuário = conta excluída ou token de outro banco; sessões anteriores a uma troca de senha também caem
-    if (!u || (u.tva && tk.iat * 1000 < u.tva)) throw new Error('sessão inválida');
-    req.uid = Number(tk.id);
+    if (raw.startsWith('atha_')) {
+      const [row] = await sql`select id, user_id, scopes, last_used_at from api_tokens
+        where token_hash = ${sha256(raw)} and revoked_at is null
+          and (expires_at is null or expires_at > ${new Date().toISOString()})`;
+      if (!row) return res.status(401).json({ error: 'Não autorizado' });
+      req.uid = Number(row.user_id);
+      req.agent = true;
+      req.scopes = String(row.scopes || '').split(',').map((s: string) => s.trim()).filter(Boolean);
+      const seen = row.last_used_at ? Date.parse(row.last_used_at) : 0;
+      if (!(seen > Date.now() - 5 * 60_000)) await sql`update api_tokens set last_used_at = ${new Date().toISOString()} where id = ${row.id}`;
+    } else {
+      const tk: any = jwt.verify(raw, secret());
+      const [u] = await sql`select token_valid_after::float8 as tva from users where id = ${Number(tk.id)}`;
+      // sem usuário = conta excluída ou token de outro banco; sessões anteriores a uma troca de senha também caem
+      if (!u || (u.tva && tk.iat * 1000 < u.tva)) throw new Error('sessão inválida');
+      req.uid = Number(tk.id);
+      req.agent = false;
+      req.scopes = ALL_SCOPES; // sessão do app enxerga tudo; o token de agente só o que foi gravado
+    }
   } catch (e: any) {
     if (e instanceof ConfigError || e?.code) throw e; // erro de infraestrutura não vira "não autorizado"
     return res.status(401).json({ error: 'Não autorizado' });
@@ -158,6 +183,15 @@ r.use(A(async (req: any, res: any, next: any) => {
 }));
 
 const idOf = (v: unknown) => (Number.isInteger(Number(v)) ? Number(v) : -1);
+const extKey = (source: unknown, externalId: unknown) => {
+  const s = String(source ?? '').trim(), e = String(externalId ?? '').trim();
+  if (!s || !e || s.length > 100 || e.length > 200) return null;
+  return { source: s, externalId: e };
+};
+// token de agente nunca mexe na conta nem nos próprios tokens, mesmo que alguém grave um escopo a mais
+const noAgent = (req: any, res: any, next: any) => req.agent ? res.status(403).json({ error: 'Tokens de integração não acessam esta rota' }) : next();
+const need = (scope: string) => (req: any, res: any, next: any) =>
+  (req.scopes || []).includes(scope) ? next() : res.status(403).json({ error: 'Escopo insuficiente' });
 
 r.get('/me', A(async (req: any, res: any) => {
   const [u] = await sql`select name, email, terms_version from users where id = ${req.uid}`;
@@ -177,7 +211,7 @@ const confirmPassword = async (uid: number, password: unknown, res: any) => {
   await clearFails(k);
   return true;
 };
-r.patch('/me/profile', A(async (req: any, res: any) => {
+r.patch('/me/profile', noAgent, A(async (req: any, res: any) => {
   const [cur] = await sql`select name, email from users where id = ${req.uid}`;
   const name = String(req.body?.name ?? cur.name).trim(), email = String(req.body?.email ?? cur.email).trim().toLowerCase();
   if (name.length < 2 || name.length > 60) return res.status(400).json({ error: 'Informe seu nome (2 a 60 caracteres)' });
@@ -192,7 +226,7 @@ r.patch('/me/profile', A(async (req: any, res: any) => {
     throw e;
   }
 }));
-r.post('/me/password', A(async (req: any, res: any) => {
+r.post('/me/password', noAgent, A(async (req: any, res: any) => {
   const [u] = await sql`select name, email from users where id = ${req.uid}`;
   const current = String(req.body?.current ?? ''), next = String(req.body?.next ?? '');
   if (!(await confirmPassword(req.uid, current, res))) return;
@@ -202,15 +236,52 @@ r.post('/me/password', A(async (req: any, res: any) => {
   await sql`update users set hash = ${hash(next)}, token_valid_after = ${Math.floor(Date.now() / 1000) * 1000} where id = ${req.uid}`;
   res.json({ token: sign(req.uid) }); // novo token para este aparelho; os outros são desconectados
 }));
-r.post('/me/delete', A(async (req: any, res: any) => {
+r.post('/me/delete', noAgent, A(async (req: any, res: any) => {
   if (!(await confirmPassword(req.uid, req.body?.password, res))) return;
-  await sql`delete from users where id = ${req.uid}`; // hábitos, tarefas, check-ins e treinos saem em cascata
+  await sql`delete from users where id = ${req.uid}`; // hábitos, tarefas, check-ins, treinos e tokens saem em cascata
+  res.sendStatus(204);
+}));
+
+// ---------- tokens de integração (só sessão; o valor cru sai uma única vez) ----------
+const parseScopes = (v: unknown) => {
+  if (v == null || v === '') return DEFAULT_SCOPES;
+  const list = [...new Set((Array.isArray(v) ? v : String(v).split(',')).map(s => String(s).trim()).filter(Boolean))];
+  if (!list.length || list.some(s => !ALL_SCOPES.includes(s))) return null;
+  return list.join(',');
+};
+r.get('/me/tokens', noAgent, A(async (req: any, res: any) => {
+  res.json(await sql`select id, name, prefix, scopes, created_at, last_used_at, expires_at, revoked_at
+    from api_tokens where user_id = ${req.uid} order by id desc`);
+}));
+r.post('/me/tokens', noAgent, A(async (req: any, res: any) => {
+  if (!(await confirmPassword(req.uid, req.body?.password, res))) return;
+  const name = String(req.body?.name ?? '').trim();
+  if (name.length < 1 || name.length > 80) return res.status(400).json({ error: 'Informe um nome (até 80 caracteres)' });
+  const scopes = parseScopes(req.body?.scopes);
+  if (!scopes) return res.status(400).json({ error: 'Escopo inválido' });
+  let expires_at: string | null = null;
+  if (req.body?.expires_days != null && req.body.expires_days !== '') {
+    const d = Number(req.body.expires_days);
+    if (!Number.isInteger(d) || d < 1 || d > 3650) return res.status(400).json({ error: 'expires_days deve ser um número inteiro de 1 a 3650' });
+    expires_at = new Date(Date.now() + d * 86_400_000).toISOString();
+  }
+  const token = 'atha_' + randomBytes(32).toString('base64url');
+  const created_at = touch();
+  const [row] = await sql`insert into api_tokens(user_id, name, prefix, token_hash, scopes, created_at, expires_at)
+    values (${req.uid}, ${name}, ${token.slice(0, 8)}, ${sha256(token)}, ${scopes}, ${created_at}, ${expires_at})
+    returning id, name, prefix, scopes, created_at, expires_at`;
+  res.status(201).json({ ...row, token });
+}));
+r.delete('/me/tokens/:id', noAgent, A(async (req: any, res: any) => {
+  const rows = await sql`update api_tokens set revoked_at = coalesce(revoked_at, ${touch()})
+    where id = ${idOf(req.params.id)} and user_id = ${req.uid} returning id`;
+  if (!rows.length) return res.sendStatus(404);
   res.sendStatus(204);
 }));
 
 // ---------- dashboard ----------
-r.get('/dashboard', A(async (req: any, res: any) => {
-  const uid = req.uid, t = dateOr(req.query.today, iso()), w = addDays(t, 7), wd = new Date(t + 'T12:00').getDay();
+r.get('/dashboard', need('dashboard:read'), A(async (req: any, res: any) => {
+  const uid = req.uid, t = dateOr(req.query.date ?? req.query.today, iso()), w = addDays(t, 7), wd = new Date(t + 'T12:00').getDay();
   const [[u], acts, tkRows, [tp], habitRows, exRows, [ci]] = await Promise.all([
     sql`select name from users where id = ${uid}`,
     // atividade por dia e tipo (hábito, check-in, tarefa concluída, treino): base do heatmap e da sequência
@@ -259,35 +330,49 @@ r.get('/dashboard', A(async (req: any, res: any) => {
 }));
 
 // ---------- hábitos ----------
-r.get('/habits', A(async (req: any, res: any) => {
-  const habits = await sql`select id, name, "time", weekdays, created_at from habits where user_id = ${req.uid} order by "time" nulls first, id`;
+r.get('/habits', need('habits:read'), A(async (req: any, res: any) => {
+  const habits = await sql`select id, name, "time", weekdays, created_at, source, external_id, updated_at from habits where user_id = ${req.uid} order by "time" nulls first, id`;
   const logs = await sql`select habit_id, date from habit_logs where habit_id in (select id from habits where user_id = ${req.uid})`;
   const byHabit = new Map<number, string[]>();
   for (const l of logs) (byHabit.get(l.habit_id) ?? byHabit.set(l.habit_id, []).get(l.habit_id)!).push(l.date);
   res.json(habits.map((h: any) => ({ ...h, weekdays: wkArr(h.weekdays), logs: byHabit.get(h.id) ?? [] })));
 }));
-r.post('/habits', A(async (req: any, res: any) => {
+r.post('/habits', need('habits:write'), A(async (req: any, res: any) => {
   const { name, time, weekdays, date } = req.body ?? {};
   if (!name || String(name).length > 100) return res.status(400).json({ error: 'Nome obrigatório (até 100 caracteres)' });
-  const w = wkStr(weekdays), created = dateOr(date, iso());
-  const [h] = await sql`insert into habits(user_id, name, "time", weekdays, created_at)
-    values (${req.uid}, ${String(name).trim()}, ${time || null}, ${w}, ${created}) returning id, name, "time", created_at`;
+  const w = wkStr(weekdays), created = dateOr(date, iso()), updated = touch();
+  const [h] = await sql`insert into habits(user_id, name, "time", weekdays, created_at, updated_at)
+    values (${req.uid}, ${String(name).trim()}, ${time || null}, ${w}, ${created}, ${updated}) returning id, name, "time", created_at, updated_at`;
   res.status(201).json({ ...h, weekdays: wkArr(w), logs: [] });
 }));
-r.patch('/habits/:id', A(async (req: any, res: any) => {
-  const id = idOf(req.params.id), b = req.body ?? {};
-  if ('weekdays' in b) await sql`update habits set weekdays = ${wkStr(b.weekdays)} where id = ${id} and user_id = ${req.uid}`;
-  if (b.name) await sql`update habits set name = ${String(b.name).trim()} where id = ${id} and user_id = ${req.uid}`;
-  if ('time' in b) await sql`update habits set "time" = ${b.time || null} where id = ${id} and user_id = ${req.uid}`;
-  const [h] = await sql`select id, name, "time", weekdays from habits where id = ${id} and user_id = ${req.uid}`;
+r.put('/habits/external/:source/:externalId', need('habits:write'), A(async (req: any, res: any) => {
+  const key = extKey(req.params.source, req.params.externalId);
+  if (!key) return res.status(400).json({ error: 'Origem ou id externo inválido' });
+  const b = req.body ?? {};
+  if (!b.name || String(b.name).length > 100) return res.status(400).json({ error: 'Nome obrigatório (até 100 caracteres)' });
+  const w = wkStr(b.weekdays), created = dateOr(b.date, iso()), updated = touch();
+  const [h] = await sql`insert into habits(user_id, name, "time", weekdays, created_at, source, external_id, updated_at)
+    values (${req.uid}, ${String(b.name).trim()}, ${b.time || null}, ${w}, ${created}, ${key.source}, ${key.externalId}, ${updated})
+    on conflict (user_id, source, external_id) where external_id is not null do update set
+      name = excluded.name, "time" = excluded."time", weekdays = excluded.weekdays, updated_at = excluded.updated_at
+    returning id, name, "time", weekdays, created_at, source, external_id, updated_at`;
+  const logs = await sql`select date from habit_logs where habit_id = ${h.id}`;
+  res.json({ ...h, weekdays: wkArr(h.weekdays), logs: logs.map((l: any) => l.date) });
+}));
+r.patch('/habits/:id', need('habits:write'), A(async (req: any, res: any) => {
+  const id = idOf(req.params.id), b = req.body ?? {}, updated = touch();
+  if ('weekdays' in b) await sql`update habits set weekdays = ${wkStr(b.weekdays)}, updated_at = ${updated} where id = ${id} and user_id = ${req.uid}`;
+  if (b.name) await sql`update habits set name = ${String(b.name).trim()}, updated_at = ${updated} where id = ${id} and user_id = ${req.uid}`;
+  if ('time' in b) await sql`update habits set "time" = ${b.time || null}, updated_at = ${updated} where id = ${id} and user_id = ${req.uid}`;
+  const [h] = await sql`select id, name, "time", weekdays, source, external_id, updated_at from habits where id = ${id} and user_id = ${req.uid}`;
   if (!h) return res.sendStatus(404);
   res.json({ ...h, weekdays: wkArr(h.weekdays) });
 }));
-r.delete('/habits/:id', A(async (req: any, res: any) => {
+r.delete('/habits/:id', need('habits:write'), A(async (req: any, res: any) => {
   await sql`delete from habits where id = ${idOf(req.params.id)} and user_id = ${req.uid}`;
   res.sendStatus(204);
 }));
-r.post('/habits/:id/toggle', A(async (req: any, res: any) => {
+r.post('/habits/:id/toggle', need('habits:write'), A(async (req: any, res: any) => {
   const id = idOf(req.params.id), date = dateOr(req.body?.date, iso());
   const own = await sql`select 1 from habits where id = ${id} and user_id = ${req.uid}`;
   if (!own.length) return res.sendStatus(404);
@@ -295,46 +380,98 @@ r.post('/habits/:id/toggle', A(async (req: any, res: any) => {
   if (!del.count) await sql`insert into habit_logs(habit_id, date) values (${id}, ${date}) on conflict do nothing`;
   res.json({ done: !del.count });
 }));
+r.put('/habits/:id/logs/:date', need('habits:write'), A(async (req: any, res: any) => {
+  const id = idOf(req.params.id), date = String(req.params.date || '');
+  if (!DATE_RE.test(date)) return res.status(400).json({ error: 'Data inválida' });
+  const own = await sql`select 1 from habits where id = ${id} and user_id = ${req.uid}`;
+  if (!own.length) return res.sendStatus(404);
+  await sql`insert into habit_logs(habit_id, date) values (${id}, ${date}) on conflict do nothing`;
+  res.json({ done: true });
+}));
+r.delete('/habits/:id/logs/:date', need('habits:write'), A(async (req: any, res: any) => {
+  const id = idOf(req.params.id), date = String(req.params.date || '');
+  if (!DATE_RE.test(date)) return res.status(400).json({ error: 'Data inválida' });
+  const own = await sql`select 1 from habits where id = ${id} and user_id = ${req.uid}`;
+  if (!own.length) return res.sendStatus(404);
+  await sql`delete from habit_logs where habit_id = ${id} and date = ${date}`;
+  res.json({ done: false });
+}));
 
 // ---------- tarefas ----------
 const TF = ['name', 'description', 'category', 'status', 'started_at', 'finished_at', 'due_date'];
-r.get('/tasks', A(async (req: any, res: any) => {
-  res.json(await sql`select id, name, description, category, status, started_at, finished_at, due_date from tasks where user_id = ${req.uid} order by id desc`);
+r.get('/tasks', need('tasks:read'), A(async (req: any, res: any) => {
+  res.json(await sql`select id, name, description, category, status, started_at, finished_at, due_date, source, external_id, updated_at from tasks where user_id = ${req.uid} order by id desc`);
 }));
-r.post('/tasks', A(async (req: any, res: any) => {
+r.post('/tasks', need('tasks:write'), A(async (req: any, res: any) => {
   const b = req.body ?? {};
   if (!b.name || String(b.name).length > 200) return res.status(400).json({ error: 'Nome obrigatório (até 200 caracteres)' });
   const status = STATUSES.includes(b.status) ? b.status : 'NAO_INICIADA';
-  const [t] = await sql`insert into tasks(user_id, name, description, category, status, started_at, finished_at, due_date)
+  const finished = b.finished_at || (status === 'FINALIZADA' ? nowL(b.date) : null);
+  const [t] = await sql`insert into tasks(user_id, name, description, category, status, started_at, finished_at, due_date, updated_at)
     values (${req.uid}, ${String(b.name).trim()}, ${b.description || null}, ${b.category || 'Geral'}, ${status},
-            ${b.started_at || null}, ${b.finished_at || null}, ${DATE_RE.test(b.due_date || '') ? b.due_date : null})
-    returning id, name, description, category, status, started_at, finished_at, due_date`;
+            ${b.started_at || null}, ${finished}, ${DATE_RE.test(b.due_date || '') ? b.due_date : null}, ${touch()})
+    returning id, name, description, category, status, started_at, finished_at, due_date, source, external_id, updated_at`;
   res.status(201).json(t);
 }));
-r.patch('/tasks/:id', A(async (req: any, res: any) => {
-  const id = idOf(req.params.id), b = req.body ?? {}, cols = TF.filter(k => k in b);
+r.put('/tasks/external/:source/:externalId', need('tasks:write'), A(async (req: any, res: any) => {
+  const key = extKey(req.params.source, req.params.externalId);
+  if (!key) return res.status(400).json({ error: 'Origem ou id externo inválido' });
+  const b = req.body ?? {};
+  if (!b.name || String(b.name).length > 200) return res.status(400).json({ error: 'Nome obrigatório (até 200 caracteres)' });
+  if ('status' in b && b.status && !STATUSES.includes(b.status)) return res.status(400).json({ error: 'Status inválido' });
+  const status = STATUSES.includes(b.status) ? b.status : 'NAO_INICIADA';
+  const providedFinished = !!b.finished_at;
+  const finished = providedFinished ? b.finished_at : (status === 'FINALIZADA' ? nowL(b.date) : null);
+  const due = DATE_RE.test(b.due_date || '') ? b.due_date : null;
+  const [t] = await sql`insert into tasks(user_id, name, description, category, status, started_at, finished_at, due_date, source, external_id, updated_at)
+    values (${req.uid}, ${String(b.name).trim()}, ${b.description || null}, ${b.category || 'Geral'}, ${status},
+            ${b.started_at || null}, ${finished}, ${due}, ${key.source}, ${key.externalId}, ${touch()})
+    on conflict (user_id, source, external_id) where external_id is not null do update set
+      name = excluded.name,
+      description = excluded.description,
+      category = excluded.category,
+      status = excluded.status,
+      started_at = excluded.started_at,
+      finished_at = case
+        when ${providedFinished} then excluded.finished_at
+        when excluded.status = 'FINALIZADA' and tasks.status is distinct from 'FINALIZADA' then excluded.finished_at
+        when excluded.status = 'FINALIZADA' then tasks.finished_at
+        else excluded.finished_at
+      end,
+      due_date = excluded.due_date,
+      updated_at = excluded.updated_at
+    returning id, name, description, category, status, started_at, finished_at, due_date, source, external_id, updated_at`;
+  res.json(t);
+}));
+r.patch('/tasks/:id', need('tasks:write'), A(async (req: any, res: any) => {
+  const id = idOf(req.params.id), b = req.body ?? {};
   if ('name' in b && !b.name) return res.status(400).json({ error: 'Nome obrigatório' });
   if ('status' in b && !STATUSES.includes(b.status)) return res.status(400).json({ error: 'Status inválido' });
-  if (cols.length) {
-    const vals: Record<string, any> = {};
-    for (const k of cols) vals[k] = k === 'due_date' ? (DATE_RE.test(b[k] || '') ? b[k] : null) : b[k] || null;
-    await sql`update tasks set ${sql(vals, ...cols)} where id = ${id} and user_id = ${req.uid}`;
+  if (b.status === 'FINALIZADA' && !b.finished_at) {
+    const [cur] = await sql`select status from tasks where id = ${id} and user_id = ${req.uid}`;
+    if (cur && cur.status !== 'FINALIZADA') b.finished_at = nowL(b.date);
   }
-  const [t] = await sql`select id, name, description, category, status, started_at, finished_at, due_date from tasks where id = ${id} and user_id = ${req.uid}`;
+  const cols = TF.filter(k => k in b);
+  if (cols.length) {
+    const vals: Record<string, any> = { updated_at: touch() };
+    for (const k of cols) vals[k] = k === 'due_date' ? (DATE_RE.test(b[k] || '') ? b[k] : null) : b[k] || null;
+    await sql`update tasks set ${sql(vals, ...cols, 'updated_at')} where id = ${id} and user_id = ${req.uid}`;
+  }
+  const [t] = await sql`select id, name, description, category, status, started_at, finished_at, due_date, source, external_id, updated_at from tasks where id = ${id} and user_id = ${req.uid}`;
   if (!t) return res.sendStatus(404);
   res.json(t);
 }));
-r.delete('/tasks/:id', A(async (req: any, res: any) => {
+r.delete('/tasks/:id', need('tasks:write'), A(async (req: any, res: any) => {
   await sql`delete from tasks where id = ${idOf(req.params.id)} and user_id = ${req.uid}`;
   res.sendStatus(204);
 }));
 
 // ---------- check-ins ----------
-r.get('/checkins', A(async (req: any, res: any) => {
+r.get('/checkins', need('checkins:read'), A(async (req: any, res: any) => {
   const rows = await sql`select date, tags, notes from checkins where user_id = ${req.uid} order by date desc limit 30`;
   res.json(rows.map((c: any) => { let tags: string[] = []; try { tags = JSON.parse(c.tags); } catch {} return { ...c, tags }; }));
 }));
-r.put('/checkins/:date', A(async (req: any, res: any) => {
+r.put('/checkins/:date', need('checkins:write'), A(async (req: any, res: any) => {
   const date = req.params.date;
   if (!DATE_RE.test(date)) return res.status(400).json({ error: 'Data inválida' });
   const tags = (Array.isArray(req.body?.tags) ? req.body.tags : []).map(String).slice(0, 20);
@@ -345,10 +482,10 @@ r.put('/checkins/:date', A(async (req: any, res: any) => {
 }));
 
 // ---------- treinos (dia -> exercícios) e sessões (execução -> séries) ----------
-r.get('/workouts', A(async (req: any, res: any) => {
+r.get('/workouts', need('workouts:read'), A(async (req: any, res: any) => {
   res.json(await sql`select id, weekday, name, sets, obs from workout_exercises where user_id = ${req.uid} order by weekday, id`);
 }));
-r.post('/workouts', A(async (req: any, res: any) => {
+r.post('/workouts', need('workouts:write'), A(async (req: any, res: any) => {
   const b = req.body ?? {}, weekday = Number(b.weekday);
   if (!b.name || !Number.isInteger(weekday) || weekday < 0 || weekday > 6) return res.status(400).json({ error: 'Dia e nome obrigatórios' });
   const sets = Math.min(50, Math.max(1, Math.round(+b.sets || 3)));
@@ -356,12 +493,12 @@ r.post('/workouts', A(async (req: any, res: any) => {
     values (${req.uid}, ${weekday}, ${String(b.name).trim()}, ${sets}, ${b.obs || null}) returning id, weekday, name, sets, obs`;
   res.status(201).json(w);
 }));
-r.delete('/workouts/:id', A(async (req: any, res: any) => {
+r.delete('/workouts/:id', need('workouts:write'), A(async (req: any, res: any) => {
   await sql`delete from workout_exercises where id = ${idOf(req.params.id)} and user_id = ${req.uid}`;
   res.sendStatus(204);
 }));
 
-r.post('/sessions', A(async (req: any, res: any) => {
+r.post('/sessions', need('workouts:write'), A(async (req: any, res: any) => {
   const b = req.body ?? {};
   if (!Array.isArray(b.exercises) || b.exercises.length > 100) return res.status(400).json({ error: 'Exercícios obrigatórios' });
   const date = dateOr(b.date, iso());
@@ -380,7 +517,7 @@ r.post('/sessions', A(async (req: any, res: any) => {
 }));
 
 // evolução: todas as séries (reps x carga) por exercício e sessão + resumo das sessões
-r.get('/progress', A(async (req: any, res: any) => {
+r.get('/progress', need('workouts:read'), A(async (req: any, res: any) => {
   const [sets, sessions] = await Promise.all([
     sql`select ss.exercise, s.id as session_id, s.date, ss.set_number, ss.reps, ss.load_kg
         from session_sets ss join sessions s on s.id = ss.session_id
